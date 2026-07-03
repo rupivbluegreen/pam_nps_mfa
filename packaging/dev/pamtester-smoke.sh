@@ -65,7 +65,7 @@ EOF
 # 1) missing config -> PAM_AUTHINFO_UNAVAIL (pamtester prints the pam_strerror)
 write_service "$WORK/does-not-exist.conf"
 out=$(printf 'x\n' | pamtester -v "$SERVICE" testuser authenticate 2>&1); rc=$?
-check "missing config -> AUTHINFO_UNAVAIL" "information is unavailable\|authentication information" "$rc" "$out"
+check "missing config -> AUTHINFO_UNAVAIL" "cannot retrieve authentication info\|information is unavailable" "$rc" "$out"
 
 # 2) permissive (group/other-readable) config -> AUTHINFO_UNAVAIL
 cat >"$STUB_CONF" <<EOF
@@ -76,7 +76,7 @@ echo "s3cr3t-placeholder" > "$WORK/secret"
 chmod 0644 "$STUB_CONF"; chmod 0600 "$WORK/secret"; chown root:root "$STUB_CONF" "$WORK/secret" 2>/dev/null
 write_service "$STUB_CONF"
 out=$(printf 'x\n' | pamtester -v "$SERVICE" testuser authenticate 2>&1); rc=$?
-check "0644 config -> AUTHINFO_UNAVAIL" "information is unavailable\|authentication information" "$rc" "$out"
+check "0644 config -> AUTHINFO_UNAVAIL" "cannot retrieve authentication info\|information is unavailable" "$rc" "$out"
 
 # 3) empty password with a valid (0600 root) config -> PAM_AUTH_ERR
 #    (module rejects the empty authtok before any network I/O)
