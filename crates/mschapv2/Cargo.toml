@@ -6,6 +6,23 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# RFC 2759 primitives. md4 and des are intentionally weak and REQUIRED by
+# MSCHAPv2 (CLAUDE.md rule 9); do not remove or "upgrade" them. Versions are
+# pinned in the workspace per IMPLEMENTATION_SPEC.md §2.
+md4.workspace = true
+des.workspace = true
+sha1.workspace = true
+# Constant-time comparison for the Success authenticator (CLAUDE.md rule 6/7).
+subtle.workspace = true
+# Wipe password-equivalent material on drop (CLAUDE.md rule 8). Used directly;
+# this crate does NOT depend on the workspace `secrets` crate (built in phase 4)
+# so it compiles standalone now.
+zeroize.workspace = true
+# OS CSPRNG for the Authenticator/Peer challenges; failure denies (rule 18).
+getrandom.workspace = true
+# The RFC 2548 Vendor-Specific envelope (Vendor-Id 311) and the bounded
+# response parser this crate builds on (IMPLEMENTATION_SPEC.md §5).
+radius.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
