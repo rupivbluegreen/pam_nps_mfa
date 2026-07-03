@@ -21,6 +21,8 @@ mod auth;
 mod binding;
 mod packet;
 mod parse;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod transport;
 
 pub use auth::{

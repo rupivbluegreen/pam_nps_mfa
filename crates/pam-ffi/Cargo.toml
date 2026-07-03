@@ -9,8 +9,17 @@ build = "build.rs"
 [lib]
 # The single cdylib of the workspace (IMPLEMENTATION_SPEC.md section 1).
 # Output file is libpam_nps_mfa.so; packaging installs it as pam_nps_mfa.so.
+# The rlib exists only so the safe modules (flow, options, conversation) can
+# be driven by the integration tests; it is never installed.
 name = "pam_nps_mfa"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+# CLAUDE.md rule 2: memory-safety opt-outs are denied crate-wide; src/ffi.rs
+# alone opts back in with an inner allow. The lint level lives here (not as an
+# attribute in lib.rs) so that src/ffi.rs is the only file under src/ that
+# mentions the lint's name at all, which keeps the rule mechanically greppable.
+[lints.rust]
+unsafe_code = "deny"
 
 [dependencies]
 radius.workspace = true
@@ -22,3 +31,13 @@ audit.workspace = true
 libc.workspace = true
 zeroize.workspace = true
 getrandom.workspace = true
+
+[dev-dependencies]
+# The in-memory transport fake that drives the flow/return-code tests
+# (IMPLEMENTATION_SPEC.md section 1: trait-based transport, tested socket-free).
+radius = { workspace = true, features = ["test-support"] }
+# dlopen smoke test for the three exported pam_sm_* symbols (phase-5 gate).
+# Dev-only addition, recorded per IMPLEMENTATION_SPEC.md section 2: the spec's
+# pinned list predates the symbol-export smoke test; libloading is never linked
+# into the shipped module.
+libloading = "0.8"

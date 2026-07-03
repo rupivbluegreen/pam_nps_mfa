@@ -15,5 +15,11 @@ subtle.workspace = true
 # OS CSPRNG for the Request Authenticator; failure denies (CLAUDE.md rule 18).
 getrandom.workspace = true
 
+[features]
+# Exposes the public in-memory FakeTransport (src/test_support.rs) used by the
+# pam-ffi flow tests (phase 5) and the transport tests (phase 6). Test-only
+# tooling; never enabled by the production cdylib build.
+test-support = []
+
 [dev-dependencies]
 hex-literal.workspace = true
