@@ -1,0 +1,24 @@
+[package]
+name = "pam-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+# The single cdylib of the workspace (IMPLEMENTATION_SPEC.md section 1).
+# Output file is libpam_nps_mfa.so; packaging installs it as pam_nps_mfa.so.
+name = "pam_nps_mfa"
+crate-type = ["cdylib"]
+
+[dependencies]
+radius.workspace = true
+mschapv2.workspace = true
+pap.workspace = true
+config.workspace = true
+secrets.workspace = true
+audit.workspace = true
+libc.workspace = true
+zeroize.workspace = true
+getrandom.workspace = true

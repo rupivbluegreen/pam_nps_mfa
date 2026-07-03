@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pam-ffi",
+    "crates/radius",
+    "crates/mschapv2",
+    "crates/pap",
+    "crates/config",
+    "crates/secrets",
+    "crates/audit",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/rupivbluegreen/pam_nps_mfa"
+
+[workspace.dependencies]
+# crypto (RustCrypto) — versions pinned per IMPLEMENTATION_SPEC.md section 2.
+# md4 and des are intentionally weak primitives required by MSCHAPv2 (CLAUDE.md rule 9).
+md4 = "0.10"
+des = "0.8"
+sha1 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
+
+# hygiene
+subtle = "2.5"
+zeroize = { version = "1.7", features = ["derive"] }
+getrandom = "0.2"
+
+# platform
+libc = "0.2"
+
+# dev
+hex-literal = "0.4"
+
+# intra-workspace
+radius = { path = "crates/radius" }
+mschapv2 = { path = "crates/mschapv2" }
+pap = { path = "crates/pap" }
+config = { path = "crates/config" }
+secrets = { path = "crates/secrets" }
+audit = { path = "crates/audit" }
+
+# NOTE: panic stays "unwind" (the default) in every profile — the FFI
+# boundary catch_unwind (CLAUDE.md rule 10) depends on it. Do not add
+# panic = "abort".
