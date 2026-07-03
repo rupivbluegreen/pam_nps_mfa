@@ -1,0 +1,133 @@
+# Release pipeline: build RPMs for the RHEL9 family, EL10, and Fedora, then
+# publish them on a GitHub Release.
+#
+# Triggers:
+#   - push of a tag matching v*   -> build + create the release for that tag
+#   - workflow_dispatch           -> build only (artifacts, no release), a dry
+#                                    run of the packaging matrix
+#
+# Any tag containing a hyphen (v0.1.0-alpha, v0.2.0-rc1) is marked
+# prerelease. Until phase 9 (real-NPS validation) has passed, EVERY release
+# from this repository must be a hyphenated pre-release tag.
+#
+# The build driver is packaging/build-rpm.sh — the same script used for local
+# docker validation. The phase-8 packaging GATE (install + placement verify)
+# is packaging/build-in-ubi9.sh and is deliberately not part of this pipeline.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rpm:
+    name: rpm (${{ matrix.dist }})
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # el9 covers RHEL 9 / AlmaLinux 9 / Rocky Linux 9. AlmaLinux (not
+          # ubi) because selinux-policy-devel lives in CRB, which
+          # subscription-less ubi images do not ship.
+          - image: almalinux:9
+            dist: el9
+          - image: almalinux:10
+            dist: el10
+          - image: fedora:42
+            dist: fc42
+    steps:
+      # checkout@v4 needs git in the container, and build-rpm.sh step 2 needs
+      # tar; install them before anything else.
+      - name: Install git + tar
+        run: dnf install -y git-core tar gzip
+
+      - uses: actions/checkout@v4
+
+      - name: Build RPM + SRPM
+        env:
+          SRC_DIR: ${{ github.workspace }}
+          OUT_DIR: ${{ github.workspace }}/out
+        run: bash packaging/build-rpm.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.dist }}
+          path: out/*.rpm
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: rpm
+    # Only a v* tag publishes; a workflow_dispatch run stops at artifacts.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: assets
+        run: |
+          # The dist-tagged SRPMs (el9/el10/fc42) are content-identical source
+          # rpms; ship only the el9 one to keep the asset list unambiguous.
+          find . -name '*.src.rpm' ! -name '*.el9.src.rpm' -delete
+          sha256sum *.rpm > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        working-directory: assets
+        run: |
+          flags=(--verify-tag --title "$TAG")
+          # Hyphenated tag => prerelease. Mandatory until phase 9 passes.
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+
+          cat > notes.md <<'EOF'
+          > [!WARNING]
+          > **Pre-release — DO NOT deploy to production.** Phase 9 — validation
+          > against a real Microsoft NPS with the Entra MFA extension — has
+          > **not** been completed. This build is for lab and test environments
+          > only, and nothing about it should be described as production-ready.
+
+          PAM authentication module that turns a Linux host into a hardened
+          RADIUS client for Microsoft NPS (MSCHAPv2 primary, PAP optional),
+          failing closed on every error path.
+
+          ## Packages
+
+          | dist tag | built on | for |
+          |---|---|---|
+          | `el9` | AlmaLinux 9 | RHEL 9, AlmaLinux 9, Rocky Linux 9 (primary platform) |
+          | `el10` | AlmaLinux 10 | RHEL 10 family — packaging builds, module untested there |
+          | `fc42` | Fedora 42 | Fedora — packaging builds, module untested there |
+
+          Only the el9 build has been through the phase-8 packaging gate.
+          `SHA256SUMS` covers every attached asset; verify before installing:
+          `sha256sum -c SHA256SUMS --ignore-missing`
+
+          ## Before you install
+
+          Read the [security notes in the README](https://github.com/rupivbluegreen/pam_nps_mfa#security-notes-you-must-read-before-deploying)
+          first — IPsec is a required control, sshd must be configured to close
+          the public-key PAM bypass, and a break-glass account is mandatory.
+          EOF
+
+          gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              "${flags[@]}" \
+              --notes-file notes.md \
+              ./*.rpm SHA256SUMS
