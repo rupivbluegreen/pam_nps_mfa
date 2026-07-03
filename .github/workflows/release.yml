@@ -1,5 +1,7 @@
-# Release pipeline: build RPMs for the RHEL9 family, EL10, and Fedora, then
-# publish them on a GitHub Release.
+# Release pipeline: build RPMs for the RHEL9 family, EL10, and Fedora, plus
+# .debs for Ubuntu LTS, install-verify everything in fresh containers
+# (including CentOS Stream 9/10 for the EL RPMs), then publish on a GitHub
+# Release.
 #
 # Triggers:
 #   - push of a tag matching v*   -> build + create the release for that tag
@@ -63,9 +65,93 @@ jobs:
           path: out/*.rpm
           if-no-files-found: error
 
+  deb:
+    name: deb (${{ matrix.series }})
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu:22.04
+            series: ubuntu22.04
+          - image: ubuntu:24.04
+            series: ubuntu24.04
+    steps:
+      - name: Install git
+        run: apt-get update -q && apt-get install -y -q git ca-certificates
+
+      - uses: actions/checkout@v4
+
+      # build-deb.sh installs a pinned rustup toolchain: the workspace
+      # Cargo.lock is lockfile v4 (cargo >= 1.78) and both LTS archives ship
+      # older cargo. The build runs --locked; the lockfile is never touched.
+      - name: Build .deb
+        env:
+          SRC_DIR: ${{ github.workspace }}
+          OUT_DIR: ${{ github.workspace }}/out
+          PKG_VERSION: ${{ github.ref_name }}
+        run: bash packaging/build-deb.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.series }}
+          path: out/*.deb
+          if-no-files-found: error
+
+  # Install-verify every package in a FRESH container before anything is
+  # published: the .debs on their own series, and the el9/el10 RPMs on CentOS
+  # Stream 9/10 (Stream needs no separate build — it consumes the EL RPMs).
+  verify:
+    name: verify (${{ matrix.artifact }})
+    runs-on: ubuntu-latest
+    needs: [rpm, deb]
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu:22.04
+            artifact: deb-ubuntu22.04
+            script: check-deb-install.sh
+          - image: ubuntu:24.04
+            artifact: deb-ubuntu24.04
+            script: check-deb-install.sh
+          - image: quay.io/centos/centos:stream9
+            artifact: rpm-el9
+            script: check-rpm-install.sh
+            dist: el9
+          - image: quay.io/centos/centos:stream10
+            artifact: rpm-el10
+            script: check-rpm-install.sh
+            dist: el10
+    steps:
+      - name: Install git
+        run: |
+          if command -v dnf >/dev/null 2>&1; then
+            dnf install -y git-core tar gzip
+          else
+            apt-get update -q && apt-get install -y -q git ca-certificates
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: pkg
+
+      - name: Install-check in fresh container
+        env:
+          PKG_DIR: ${{ github.workspace }}/pkg
+          DIST_TAG: ${{ matrix.dist }}
+        run: bash packaging/${{ matrix.script }}
+
   release:
     name: publish release
-    needs: rpm
+    needs: [rpm, deb, verify]
     # Only a v* tag publishes; a workflow_dispatch run stops at artifacts.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -83,7 +169,7 @@ jobs:
           # The dist-tagged SRPMs (el9/el10/fc42) are content-identical source
           # rpms; ship only the el9 one to keep the asset list unambiguous.
           find . -name '*.src.rpm' ! -name '*.el9.src.rpm' -delete
-          sha256sum *.rpm > SHA256SUMS
+          sha256sum *.rpm *.deb > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create GitHub release
@@ -111,11 +197,17 @@ jobs:
 
           | dist tag | built on | for |
           |---|---|---|
-          | `el9` | AlmaLinux 9 | RHEL 9, AlmaLinux 9, Rocky Linux 9 (primary platform) |
-          | `el10` | AlmaLinux 10 | RHEL 10 family — packaging builds, module untested there |
+          | `el9` | AlmaLinux 9 | RHEL 9, AlmaLinux 9, Rocky Linux 9, CentOS Stream 9 (primary platform) |
+          | `el10` | AlmaLinux 10 | RHEL 10 family, CentOS Stream 10 — packaging builds, module untested there |
           | `fc42` | Fedora 42 | Fedora — packaging builds, module untested there |
+          | `+ubuntu22.04` | Ubuntu 22.04 | Ubuntu 22.04 LTS `.deb` — install-verified, module untested there |
+          | `+ubuntu24.04` | Ubuntu 24.04 | Ubuntu 24.04 LTS `.deb` — install-verified, module untested there |
 
-          Only the el9 build has been through the phase-8 packaging gate.
+          CentOS Stream 9/10 consume the el9/el10 RPMs — each release
+          install-verifies them in fresh Stream containers. The Ubuntu
+          packages ship no SELinux policy (not applicable there) and no
+          AppArmor profile. Only the el9 build has been through the phase-8
+          packaging gate.
           `SHA256SUMS` covers every attached asset; verify before installing:
           `sha256sum -c SHA256SUMS --ignore-missing`
 
@@ -130,4 +222,4 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               "${flags[@]}" \
               --notes-file notes.md \
-              ./*.rpm SHA256SUMS
+              ./*.rpm ./*.deb SHA256SUMS
