@@ -27,6 +27,26 @@ real NPS with the Entra MFA extension) has NOT been completed. Do not deploy.**
 
 First platform: RHEL9. License: MIT.
 
+## Packages
+
+Pre-built packages are attached to [GitHub releases](https://github.com/rupivbluegreen/pam_nps_mfa/releases)
+(all pre-release until phase 9 passes — verify against the attached
+`SHA256SUMS` before installing):
+
+| Platform | Package |
+|---|---|
+| RHEL 9 / AlmaLinux 9 / Rocky Linux 9 / CentOS Stream 9 | `el9` RPM (primary platform) |
+| RHEL 10 family / CentOS Stream 10 | `el10` RPM |
+| Fedora 42 | `fc42` RPM |
+| Ubuntu 22.04 LTS / 24.04 LTS | `.deb` (`+ubuntu22.04` / `+ubuntu24.04`) |
+
+Only the RHEL9 family has been through the phase-8 packaging gate; the other
+targets are build- and install-verified in CI but otherwise untested. The
+Ubuntu `.deb` ships no SELinux policy (not applicable on Ubuntu) and no
+AppArmor profile — the confinement story there is the platform default.
+CentOS Stream installs the el9/el10 RPMs, which CI verifies in fresh Stream
+containers at release time.
+
 ## Security notes you must read before deploying
 
 - **This code runs inside the privileged monitor of sshd and the address space
