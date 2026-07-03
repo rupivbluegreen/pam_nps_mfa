@@ -1,0 +1,27 @@
+# Nested cargo-fuzz workspace, excluded from the root workspace.
+# Run on nightly: cargo fuzz run radius_response -- -max_total_time=120
+[package]
+name = "pam_nps_mfa-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.radius]
+path = "../crates/radius"
+
+[[bin]]
+name = "radius_response"
+path = "fuzz_targets/radius_response.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

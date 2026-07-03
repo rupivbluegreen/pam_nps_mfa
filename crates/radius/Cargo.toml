@@ -6,6 +6,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# HMAC-MD5 (Message-Authenticator, RFC 3579) and MD5 (Response Authenticator,
+# RFC 2865). Versions pinned in the workspace per IMPLEMENTATION_SPEC.md §2.
+md-5.workspace = true
+hmac.workspace = true
+# Constant-time comparison for every authenticator/MAC check (CLAUDE.md rule 7).
+subtle.workspace = true
+# OS CSPRNG for the Request Authenticator; failure denies (CLAUDE.md rule 18).
+getrandom.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
