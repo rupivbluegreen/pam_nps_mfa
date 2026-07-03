@@ -1,0 +1,10 @@
+# build output — Cargo.lock IS committed (binary artifact project)
+/target
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+fuzz/coverage
+**/*.rs.bk
+
+# session/agent local state
+.remember/
