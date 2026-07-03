@@ -6,6 +6,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# MD5 keystream for RFC 2865 §5.2 User-Password hiding. The crate is named
+# `md-5` on crates.io but imported as `md5`. Version pinned in the workspace
+# per IMPLEMENTATION_SPEC.md §2.
+md-5.workspace = true
+# Wipe the padded-plaintext copy and the hidden-buffer copy on drop
+# (CLAUDE.md rule 8). Used directly; this crate does NOT depend on the
+# phase-4 `secrets` crate so it compiles standalone now.
+zeroize.workspace = true
+# Bounded response parsing (ParsedResponse) and Access-Request assembly for the
+# Access-Challenge/State round-trip (IMPLEMENTATION_SPEC.md §4).
+radius.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
