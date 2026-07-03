@@ -1,12 +1,36 @@
 # CLAUDE.md
 
-Guidance for any coding agent working in this repository. Read this first, then `IMPLEMENTATION_SPEC.md`, then `TEST_VECTORS.md`. If anything you are about to write conflicts with these files, stop and ask rather than guessing.
+Guidance for any coding agent working in this repository. Read this first, then `IMPLEMENTATION_SPEC.md`, then `TEST_VECTORS.md`, then `SPEC_AMENDMENTS.md`. Amendments record approved deviations from the spec (e.g. A1 `probe_timeout`, A2 placement of libc `unsafe`) — check them before flagging an apparent spec mismatch. If anything you are about to write conflicts with these files, stop and ask rather than guessing.
 
 ## What this project is
 
 `pam_nps_mfa` is a PAM authentication module written in Rust. It turns a Linux host into a hardened RADIUS client for Microsoft NPS, so an NPS deployment with the Entra MFA extension can require a second factor on local and SSH logins. It supports two credential protocols selected by configuration: PAP and MSCHAPv2. MSCHAPv2 is the primary target. License is MIT. First platform is RHEL9, others follow once RHEL is stable.
 
 This runs inside the privileged monitor of sshd and inside the address space of sudo, su, and login. Treat every line as security-critical. A memory bug here is root. A logic bug here is an authentication bypass.
+
+## Current status
+
+Phases 1–8 are complete and their gates pass. Only phase 9 remains: human-run validation against a real NPS with the Entra MFA extension, tracked in `docs/phase9-nps-validation.md`. Until that checklist passes on real hardware, never describe the project as done or production-ready.
+
+## Workspace layout
+
+Seven-crate Cargo workspace, plus a nested cargo-fuzz workspace in `fuzz/` that is excluded from the root workspace.
+
+- `crates/radius` — RADIUS codec and transport: packet build/parse, authenticator compute/verify, response-to-request binding (`binding.rs`), the `RadiusTransport` trait (`transport.rs`), the real `UdpTransport` (`udp.rs`), and an in-memory `FakeTransport` behind the `test-support` feature (`test_support.rs`).
+- `crates/mschapv2` — RFC 2759 engine: primitives (`crypto.rs`), challenge/response/Success flow (`flow.rs`), Microsoft VSA encode/decode (`vsa.rs`).
+- `crates/pap` — User-Password hiding and the Access-Challenge + State round-trip for TOTP.
+- `crates/config` — config parsing and the file-permission refusal checks.
+- `crates/secrets` — zeroizing secret wrappers; no content-revealing `Debug`/`Display`.
+- `crates/audit` — audit record schema (`record.rs`) with auditd and syslog backends; its `ffi.rs` is one of the two permitted unsafe shims.
+- `crates/pam-ffi` — the cdylib PAM module itself; its `ffi.rs` is the other unsafe shim.
+- `packaging/` — RPM spec, SELinux policy module (`selinux/`), deployment snippets (`dist/`), dev smoke test (`dev/`), and the containerized packaging gate (`build-in-ubi9.sh`).
+
+## Architecture spine
+
+- Every authentication decision lives in safe code. The core entry point is `authenticate` in `crates/pam-ffi/src/flow.rs`: it takes already-gathered inputs, the config, a `Conversation`, and a `RadiusTransport`, so the whole return-code table (IMPLEMENTATION_SPEC.md §7) is unit-tested in `crates/pam-ffi/tests/flow_return_codes.rs` with `FakeTransport` — no PAM handle or socket needed. Prefer extending that seam over touching FFI.
+- The only two files containing `unsafe` are `crates/pam-ffi/src/ffi.rs` and `crates/audit/src/ffi.rs`. All other crates carry `#![forbid(unsafe_code)]`; pam-ffi pins the policy via `[lints.rust]` in its Cargo.toml with `ffi.rs` alone opting back in.
+- `panic = "unwind"` must stay in every profile (see the note in the root `Cargo.toml`) — the `catch_unwind` at the FFI boundary depends on it. Never add `panic = "abort"`.
+- Server failover uses the A1 two-stage timing: a short `probe_timeout` per server for explicit transport errors, then exactly one server absorbs the long MFA `timeout`. See SPEC_AMENDMENTS.md A1 before touching transport timing.
 
 ## Hard rules, no exceptions
 
@@ -60,10 +84,33 @@ cargo deny check
 
 The `md4` and `des` crates from RustCrypto are maintained and have no known CVE, so cargo-audit will most likely pass clean and you do not need to invent an exception for them. If a policy in `deny.toml` bans weak primitives, or an informational advisory does appear, record the specific ID with a comment pointing at this file and keep the crates. MSCHAPv2 mandates them. Do not remove them to make a lint pass.
 
+Building needs the libpam and libaudit headers: `libpam0g-dev` + `libaudit-dev` on Debian/Ubuntu, `pam-devel` + `audit-libs-devel` on RHEL. The smoke test additionally needs `pamtester`.
+
+Run one crate's tests, one integration-test file, or one test by name filter:
+
+```
+cargo test -p radius
+cargo test -p pam-ffi --test flow_return_codes
+cargo test -p mschapv2 <name-substring>
+```
+
 The RADIUS response parser has a fuzz target. On nightly:
 
 ```
 cargo fuzz run radius_response -- -max_total_time=120
+```
+
+The phase 5 gate is a pamtester smoke test. It must run as root, writes only a dedicated `/etc/pam.d/pam_nps_test` service (never a real auth stack), and cleans up on exit:
+
+```
+cargo build --release
+sudo bash packaging/dev/pamtester-smoke.sh
+```
+
+The phase 8 packaging gate runs in a container, never on the dev host. Use `almalinux:9`, not ubi9 — on a subscription-less UBI image the CRB repo with `selinux-policy-devel` and friends is unavailable:
+
+```
+docker run --rm -v "$(git rev-parse --show-toplevel)":/src:ro almalinux:9 bash /src/packaging/build-in-ubi9.sh
 ```
 
 ## Phase order
