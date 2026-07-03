@@ -39,6 +39,9 @@ name = "config"
 version = "0.1.0"
 dependencies = [
  "hex-literal",
+ "libc",
+ "secrets",
+ "zeroize",
 ]
 
 [[package]]
@@ -223,6 +226,7 @@ name = "secrets"
 version = "0.1.0"
 dependencies = [
  "hex-literal",
+ "zeroize",
 ]
 
 [[package]]

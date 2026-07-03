@@ -6,6 +6,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Zeroizing wrapper for the per-server shared secret (SecretString) and the
+# ZeroizingBytes scratch type (SECURITY_DESIGN.md §7, CLAUDE.md rules 3/8).
+secrets.workspace = true
+# libc is used ONLY for the O_NOFOLLOW integer constant handed to
+# OpenOptionsExt::custom_flags. No raw fd, no unsafe (IMPLEMENTATION_SPEC.md §6).
+libc.workspace = true
+# Zeroizing scratch buffer for secret-file bytes before they land in a
+# SecretString (CLAUDE.md rule 8).
+zeroize.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
