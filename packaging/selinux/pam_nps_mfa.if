@@ -1,0 +1,30 @@
+## <summary>pam_nps_mfa: PAM RADIUS/NPS MFA module policy support.</summary>
+
+########################################
+## <summary>
+##	Read the pam_nps_mfa configuration and RADIUS secret files
+##	(/etc/pam_nps, type pam_nps_conf_t).
+## </summary>
+## <desc>
+##	<p>
+##	Grants a domain read-only access to the pam_nps_mfa config tree.
+##	Provided for any other confined domain that also links pam_nps_mfa.so
+##	(e.g. a hardened sudo_t or login/local_login_t deployment). The base
+##	module already grants sshd_t; use this interface instead of writing a
+##	fresh allow rule so the access stays scoped to the dedicated type.
+##	</p>
+## </desc>
+## <param name="domain">
+##	<summary>
+##	Domain allowed to read the pam_nps_mfa config and secrets.
+##	</summary>
+## </param>
+#
+interface(`pam_nps_read_config',`
+	gen_require(`
+		type pam_nps_conf_t;
+	')
+
+	allow $1 pam_nps_conf_t:dir { search open read getattr };
+	allow $1 pam_nps_conf_t:file { open read getattr };
+')

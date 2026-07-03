@@ -1,0 +1,10 @@
+# pam_nps_mfa file contexts (IMPLEMENTATION_SPEC.md §9).
+#
+# Label the entire /etc/pam_nps tree — the pam_nps.conf file, the secret.d/
+# directory, and every per-server secret inside it — as the dedicated type
+# pam_nps_conf_t. The sshd_t read grant in pam_nps_mfa.te is scoped to exactly
+# this type, so nothing broader than this module can reach the RADIUS secrets.
+#
+# `restorecon -R /etc/pam_nps` (run by the RPM %post) applies these labels.
+
+/etc/pam_nps(/.*)?    gen_context(system_u:object_r:pam_nps_conf_t,s0)

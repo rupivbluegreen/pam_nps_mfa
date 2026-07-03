@@ -1,0 +1,82 @@
+policy_module(pam_nps_mfa, 0.1.0)
+
+########################################
+#
+# pam_nps_mfa targeted-policy module.
+#
+# The module runs INSIDE the sshd process, i.e. in the confined domain sshd_t.
+# It grants sshd_t ONLY the three things IMPLEMENTATION_SPEC.md §9 requires:
+#
+#   1. reach the RADIUS port (udp 1812, radius_port_t)
+#   2. read the dedicated /etc/pam_nps config + secret files (pam_nps_conf_t)
+#   3. write audit records (already covered by base policy; asserted here)
+#
+# Deliberately NOT present (CLAUDE.md build invariants / task constraints):
+#   - no `permissive sshd_t;`  (fail-closed; never relax the domain)
+#   - no boolean / tunable shortcut
+#   - no blanket sysnetwork, no all-ports allow — only radius_port_t
+#
+########################################
+
+require {
+	type sshd_t;
+}
+
+########################################
+#
+# Dedicated file type for /etc/pam_nps (config + secret.d/).
+# The .fc file labels /etc/pam_nps(/.*)? as pam_nps_conf_t so that ONLY this
+# module's read rule below — and nothing broader — grants sshd_t access to the
+# RADIUS shared secrets. files_type() makes it a regular file/dir security type.
+#
+########################################
+
+type pam_nps_conf_t;
+files_type(pam_nps_conf_t)
+
+########################################
+#
+# §9 requirement 2 — read the configuration and per-server secret files.
+#
+# The loader opens the file O_NOFOLLOW then fstat()s it (SECURITY_DESIGN §8),
+# so getattr/open/read on the files plus search/open/read on the directory is
+# the complete and minimal set. No write, no create, no unlink: the module only
+# ever reads this tree.
+#
+########################################
+
+allow sshd_t pam_nps_conf_t:dir { search open read getattr };
+allow sshd_t pam_nps_conf_t:file { open read getattr };
+
+########################################
+#
+# §9 requirement 1 — reach the RADIUS server on udp/1812.
+#
+# radius_port_t is the base-policy type for RADIUS ports (1812/1813 auth/acct).
+# We grant ONLY send/recv to that port type, plus the generic interface/node
+# traversal every UDP client needs. We do NOT grant corenet_all_recvfrom_*,
+# a generic port, or sysnetwork — an off-port or wrong-type destination stays
+# denied. The client socket is connect(2)ed to the peer (amendment A5), so the
+# domain also needs to operate its own udp_socket.
+#
+########################################
+
+allow sshd_t self:udp_socket { create connect getattr setattr getopt setopt read write bind };
+
+corenet_udp_sendrecv_generic_if(sshd_t)
+corenet_udp_sendrecv_generic_node(sshd_t)
+corenet_udp_sendrecv_radius_port(sshd_t)
+
+########################################
+#
+# §9 requirement 3 — write audit records (AUDIT_USER_AUTH via libaudit).
+#
+# sshd_t already holds CAP_AUDIT_WRITE and the netlink_audit_socket path in the
+# base policy; auditd emission from inside sshd therefore already works. This
+# interface is asserted here so the module is self-documenting and so the grant
+# survives if a future base-policy change tightens it. SELinux allow rules are
+# additive and idempotent, so re-stating an existing grant is harmless.
+#
+########################################
+
+logging_send_audit_msgs(sshd_t)

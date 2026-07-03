@@ -1,0 +1,38 @@
+# pam_nps_mfa — reference PAM auth-stack line (IMPLEMENTATION_SPEC.md §7).
+#
+# Add this to the sshd PAM service, typically /etc/pam.d/sshd. It bridges the
+# keyboard-interactive PAM path to Microsoft NPS for the Entra-backed second
+# factor. This snippet is shipped as DOCUMENTATION — copy the line deliberately;
+# the RPM does not edit /etc/pam.d for you.
+#
+# ---------------------------------------------------------------------------
+# The line
+# ---------------------------------------------------------------------------
+auth required pam_nps_mfa.so config=/etc/pam_nps/pam_nps.conf try_first_pass
+
+# ---------------------------------------------------------------------------
+# Ordering
+# ---------------------------------------------------------------------------
+# * Place this line AFTER the module that establishes the primary factor / the
+#   password (e.g. pam_unix or pam_sss). `try_first_pass` reuses the password
+#   that earlier module already collected; if none is present it prompts once
+#   with echo off. Use `use_first_pass` instead if an earlier module is
+#   guaranteed to have set the authtok and you never want a second prompt.
+# * `required` (not `sufficient`): a second factor must never be skippable, and
+#   a preceding success must not let the stack fall through past this module.
+# * Fail-closed mapping (SECURITY_DESIGN §11): the module returns
+#   PAM_AUTHINFO_UNAVAIL (distinct from PAM_AUTH_ERR) when no NPS server can be
+#   reached, so you MAY configure the stack to die closed on unavailability
+#   rather than fall through. Do not add a fallback `sufficient` module after
+#   this one that would turn an NPS/network outage into an open door.
+#
+# ---------------------------------------------------------------------------
+# Break-glass (REQUIRED — SECURITY_DESIGN §11, IMPLEMENTATION_SPEC.md §7)
+# ---------------------------------------------------------------------------
+# An NPS or network outage must not lock every administrator out of every host.
+# Provision ONE local, MFA-exempt break-glass admin account that lives entirely
+# outside the RADIUS path, and exempt only that account from this module — do it
+# in sshd_config with a `Match User` block (see sshd_config.snippet), NOT by
+# weakening this line. Its login is heavily audited (auditd USER_AUTH plus a
+# dedicated watch on its authorized_keys and sudo use). Rotate its credential on
+# every use. It is a last resort, not a convenience account.

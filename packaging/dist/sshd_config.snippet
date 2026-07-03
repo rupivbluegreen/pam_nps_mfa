@@ -1,0 +1,142 @@
+# pam_nps_mfa — reference sshd_config settings (SECURITY_DESIGN §4, §11;
+# IMPLEMENTATION_SPEC.md §7). Shipped as DOCUMENTATION; apply deliberately.
+#
+# ###########################################################################
+# # WHY THIS FILE EXISTS — the single most common way these deployments end
+# # up with an accidental open door (SECURITY_DESIGN §4):
+# #
+# #   SSH public-key authentication and GSSAPI authentication SKIP THE PAM
+# #   AUTH STACK ENTIRELY. If a user in scope can log in with a pubkey alone,
+# #   pam_nps_mfa.so never runs and the second factor is never enforced.
+# #
+# # The module CANNOT fix this from inside PAM. It is closed here, at the sshd
+# # layer, by forcing every in-scope login through the keyboard-interactive
+# # PAM path.
+# ###########################################################################
+
+# ###########################################################################
+# # DO NOT `cat >>` THIS FILE ONTO AN EXISTING sshd_config — READ THIS FIRST
+# #
+# # sshd_config is order-sensitive in two ways that will SILENTLY LEAVE THE
+# # BYPASS OPEN if you append this snippet blindly:
+# #
+# #  1. EVERY directive after a `Match` line belongs to that Match's scope
+# #     until the next `Match` or end-of-file. So the GLOBAL block below
+# #     (UsePAM, KbdInteractiveAuthentication, AuthenticationMethods,
+# #     GSSAPIAuthentication, LoginGraceTime) MUST appear ABOVE the FIRST
+# #     `Match` block already present in your config. If any prior `Match`
+# #     exists (very common on RHEL9 — an sftp `Match Group`, an internal-sftp
+# #     chroot, a per-user rule) and you append this, then
+# #     `AuthenticationMethods publickey,keyboard-interactive:pam` scopes ONLY
+# #     to that earlier Match's users. The real global default stays whatever
+# #     it was — typically UNSET, i.e. a public key ALONE satisfies auth and
+# #     pam_nps_mfa.so never runs. The door is open.
+# #
+# #  2. On RHEL9 the stock /etc/ssh/sshd_config begins with
+# #        Include /etc/ssh/sshd_config.d/*.conf
+# #     and OpenSSH takes the FIRST-obtained value of most keywords. A drop-in
+# #     that sorts earlier (e.g. 50-redhat.conf) can already set
+# #     AuthenticationMethods and WIN over anything you add later in the main
+# #     file. Put the global block in a drop-in that sorts FIRST (e.g.
+# #     /etc/ssh/sshd_config.d/00-pam_nps.conf) OR above the Include line.
+# #
+# # BEFORE applying, audit what is already there:
+# #     grep -RniE '^[[:space:]]*(Match|AuthenticationMethods)' \
+# #         /etc/ssh/sshd_config /etc/ssh/sshd_config.d/
+# # Then place: GLOBAL block first (above all Match blocks / sorting before any
+# # drop-in that sets AuthenticationMethods), BREAK-GLASS Match block last.
+# #
+# # VERIFY closure PER ACCOUNT with a real connection attempt — do NOT trust
+# # `sshd -T`, which prints the value for the connecting context and will happily
+# # show the intended string even while an earlier Match/drop-in wins for the
+# # accounts you care about:
+# #     ssh -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes \
+# #         <in-scope-user>@<host>        # MUST be rejected (partial auth only)
+# # A successful login here means the bypass is still open. Fix ordering and
+# # retry until every in-scope account is rejected on pubkey-alone.
+# ###########################################################################
+
+# --- Make PAM run, and make keyboard-interactive available -----------------
+# NOTE: the five directives in THIS global section (down to LoginGraceTime) must
+# sit above every Match block — see the ordering banner above.
+UsePAM yes
+KbdInteractiveAuthentication yes
+# (On older OpenSSH the directive is ChallengeResponseAuthentication yes — it is
+#  a deprecated alias of KbdInteractiveAuthentication. RHEL9's OpenSSH accepts
+#  the modern name; set it.)
+
+# --- Force the PAM second factor for accounts in scope ---------------------
+# Choose ONE of the two AuthenticationMethods policies below. Both route the
+# login through the keyboard-interactive PAM path (":pam" pins it to PAM so a
+# standalone challenge-response method cannot satisfy it):
+#
+#   (A) Password primary + NPS second factor — PAM does both the password and
+#       the NPS MFA in one keyboard-interactive conversation:
+#
+#           AuthenticationMethods keyboard-interactive:pam
+#
+#   (B) SSH public key as the PRIMARY factor, NPS as the SECOND factor. Pubkey
+#       alone no longer suffices; the keyboard-interactive:pam step (which runs
+#       pam_nps_mfa.so) is also required. Use this when you want to KEEP pubkey
+#       auth but still guarantee MFA:
+#
+#           AuthenticationMethods publickey,keyboard-interactive:pam
+#
+# Pick (B) if pubkey is your primary factor (recommended for admin hosts — it
+# preserves key-based primary auth while still forcing the NPS factor). Pick (A)
+# for password-primary hosts. Do NOT list a bare `publickey` or `gssapi-with-mic`
+# as a standalone acceptable method for in-scope users — that is exactly the
+# bypass.  Set the global default to the stricter of the two you use:
+AuthenticationMethods publickey,keyboard-interactive:pam
+
+# Belt and suspenders: if you do not rely on GSSAPI, disable it outright so it
+# can never become a bypass path.
+GSSAPIAuthentication no
+
+# Keep LoginGraceTime comfortably above the module's worst-case wall time
+# (amendment A1: (N-1)*probe_timeout + timeout). Default 120s vs a 60s MFA
+# timeout leaves ample headroom; do not lower it below that budget.
+LoginGraceTime 120
+
+# ###########################################################################
+# # Break-glass exemption (SECURITY_DESIGN §11) — the ONLY account allowed to
+# # skip the NPS path, so an NPS/network outage cannot lock everyone out.
+# # Match must be the LAST block in sshd_config. Replace `breakglass` with your
+# # local emergency admin account (a LOCAL account, never a domain/RADIUS one).
+# #
+# # ⚠ THIS BLOCK IS A TEMPLATE, NOT A SECURE DEFAULT. As written below it is
+# #   MFA-EXEMPT, PUBKEY-ONLY, AND REACHABLE FROM ANY SOURCE ADDRESS. This is
+# #   the single highest-value account on the host (the only path that reaches
+# #   root-equivalent access without the second factor). If its key leaks, an
+# #   attacker authenticates from ANYWHERE with no MFA. You MUST tighten it
+# #   before use. Two restrictions the comments below assume — NEITHER is
+# #   implied by `AuthenticationMethods publickey` alone; you have to add them:
+# #
+# #   (1) SOURCE-ADDRESS PIN. sshd applies it via the Match criteria itself, so
+# #       add `Address <mgmt-cidr>` to the Match line (shown below, commented).
+# #       Without an Address/From restriction, this account is world-reachable.
+# #       Belt-and-suspenders: also pin the key in authorized_keys with
+# #       `from="<mgmt-cidr>"` and consider a host firewall rule on port 22.
+# #
+# #   (2) FORCED AUDIT. sshd_config CANNOT enforce auditing — it must be wired
+# #       out of band and is NOT installed by this package. Add, e.g.:
+# #         auditctl -w /home/breakglass/.ssh/authorized_keys -p wa \
+# #                  -k breakglass_keys
+# #         auditctl -w /etc/sudoers.d/breakglass -p wa -k breakglass_sudo
+# #       (persist via /etc/audit/rules.d/) and alert on USER_AUTH/USER_START
+# #       for this user. Until that exists, the "heavily audited" claim is FALSE.
+# #
+# #   Do not deploy this block until (1) is in the Match line and (2) is wired.
+# ###########################################################################
+# Uncomment and set <mgmt-cidr> (e.g. 10.0.0.0/24); WITHOUT the Address clause
+# this account is pubkey-from-anywhere. The Match line IS the source pin.
+#Match User breakglass Address <mgmt-cidr>
+Match User breakglass
+    # Pubkey-only, no PAM MFA — this account exists precisely for when NPS is
+    # down. It is NOT hardened as written: add the `Address <mgmt-cidr>` pin to
+    # the Match line above and the out-of-band auditd watches described in the
+    # banner. `AuthenticationMethods publickey` alone imposes neither.
+    AuthenticationMethods publickey
+    # Its use MUST be heavily audited out of band (auditd watch on its
+    # authorized_keys + a USER_AUTH/USER_START alert) — see banner; this file
+    # does not and cannot install that. Rotate its key on every use.

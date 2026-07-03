@@ -1,0 +1,26 @@
+# pam_nps_mfa sample configuration (IMPLEMENTATION_SPEC.md §6 + amendment A1).
+#
+# This is the reference sample shipped by the RPM. The installed live copy at
+# /etc/pam_nps/pam_nps.conf MUST be root-owned and mode 0600; the module's
+# loader opens it O_NOFOLLOW, fstat()s the descriptor, and REFUSES to run if it
+# is not a regular file owned by uid 0 with no group/other permission bits
+# (SECURITY_DESIGN §8 — a permissive config is a hard failure, not a warning).
+#
+# The referenced secret paths are PLACEHOLDERS. Each must be a root-owned,
+# mode-0600 file under /etc/pam_nps/secret.d/ containing ONLY that server's
+# RADIUS shared secret (long, random, unique per host). Never a dictionary word.
+
+# One or more servers, tried in the order listed; each has its own secret file.
+server 10.0.0.10:1812 /etc/pam_nps/secret.d/nps1
+server 10.0.0.11:1812 /etc/pam_nps/secret.d/nps2
+
+protocol      mschapv2          # mschapv2 | pap  (fixed for the process, no fallback)
+timeout       60                # seconds per server; must fit sshd LoginGraceTime with headroom
+probe_timeout 5                 # seconds; per-server transport probe window (amendment A1)
+retries       1                 # retransmits of the identical packet per server
+nas_identifier tunnel-host-01   # sent as NAS-Identifier (type 32)
+nas_ip        10.20.0.5         # optional, sent as NAS-IP-Address (type 4)
+source_ip     0.0.0.0           # optional bind address for the client socket
+require_message_authenticator true   # strict; reject responses lacking Message-Authenticator
+audit         both              # auditd | syslog | both
+debug         false             # metadata only; never enables credential-byte logging
