@@ -27,6 +27,8 @@
 //! - RNG failure denies (rule 18): a failed Request Authenticator or
 //!   challenge generation is an immediate deny; nothing is sent.
 
+use std::net::SocketAddr;
+
 use config::{Config, Protocol};
 use radius::{
     attr, fill_message_authenticator, fresh_request_authenticator, parse_response, Code,
@@ -36,6 +38,74 @@ use secrets::SecretString;
 
 use crate::conversation::{prompt_response, Conversation};
 use crate::pam_codes;
+
+/// Short, machine-readable `reason=` tokens for the audit record (phase 7,
+/// IMPLEMENTATION_SPEC.md §8). They refine the coarse [`PamOutcome`]/result so
+/// an operator can tell a reject from a mutual-auth failure or a timeout, while
+/// staying uniform enough not to be a client-side user-enumeration oracle
+/// (SECURITY_DESIGN.md §11). None of these carry secret material.
+pub mod reason {
+    pub const SUCCESS: &str = "success";
+    pub const EMPTY_USERNAME: &str = "empty_username";
+    pub const EMPTY_PASSWORD: &str = "empty_password";
+    pub const NO_SERVERS: &str = "no_servers";
+    pub const RNG_FAILURE: &str = "rng_failure";
+    pub const ENCODE_FAILURE: &str = "encode_failure";
+    pub const CONV_ERROR: &str = "conv_error";
+    pub const ALL_UNREACHABLE: &str = "all_unreachable";
+    pub const TIMEOUT: &str = "timeout";
+    pub const IO_ERROR: &str = "io_error";
+    pub const BAD_RESPONSE: &str = "bad_response";
+    pub const MUTUAL_AUTH_FAILED: &str = "mutual_auth_failed";
+    pub const REJECT: &str = "reject";
+    pub const UNEXPECTED_CODE: &str = "unexpected_code";
+    pub const PASSWORD_UNREPRESENTABLE: &str = "password_unrepresentable";
+    pub const BAD_CHALLENGE: &str = "bad_challenge";
+    pub const CHALLENGE_UNANSWERABLE: &str = "challenge_unanswerable";
+    pub const EMPTY_OTP: &str = "empty_otp";
+    pub const MAX_ROUNDS: &str = "max_rounds";
+    pub const TRANSPORT_ERROR: &str = "transport_error";
+
+    // Boundary reasons — outcomes decided at the PAM boundary (crate root),
+    // before or around the flow, that still emit exactly one record.
+    pub const USER_ERROR: &str = "user_error";
+    pub const NULL_AUTHTOK: &str = "null_authtok";
+    pub const AUTHTOK_ERROR: &str = "authtok_error";
+    pub const CONFIG_ERROR: &str = "config_error";
+}
+
+/// The full result of one attempt: the [`PamOutcome`] (which fixes the return
+/// code) plus the two pieces of metadata the phase-7 audit record needs — the
+/// deciding server (the one that answered or committed to the MFA wait, if
+/// any) and a short machine [`reason`] token. The flow stays otherwise pure:
+/// this struct carries data OUT; nothing here touches a pointer or a sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthReport {
+    /// The typed outcome (→ PAM return code via [`PamOutcome::pam_code`]).
+    pub outcome: PamOutcome,
+    /// The server that decided the attempt, or `None` when none was reached
+    /// (e.g. every server was unreachable, or a pre-transport early return).
+    pub server: Option<SocketAddr>,
+    /// A short machine-readable reason token (see [`reason`]).
+    pub reason: &'static str,
+}
+
+impl AuthReport {
+    /// A report with no deciding server.
+    fn of(outcome: PamOutcome, reason: &'static str) -> Self {
+        Self {
+            outcome,
+            server: None,
+            reason,
+        }
+    }
+
+    /// Attach the deciding server address.
+    fn with_server(mut self, server: SocketAddr) -> Self {
+        self.server = Some(server);
+        self
+    }
+}
 
 /// Shown before blocking on the MSCHAPv2 push wait, so the session does not
 /// look hung while the user's phone is waiting (CLAUDE.md: no silent block).
@@ -107,26 +177,41 @@ pub fn outcome_for_config_error(_error: &config::ConfigError) -> PamOutcome {
     PamOutcome::Unavail
 }
 
-/// Run one authentication attempt. See the module docs for the guarantees;
-/// see IMPLEMENTATION_SPEC.md §7 for the outcome table this implements.
+/// Run one authentication attempt and return just the [`PamOutcome`] (the
+/// value the §7 return-code table maps). This is the stable entry point the
+/// flow tests drive; the PAM boundary uses [`authenticate_report`] instead so
+/// it can also emit the phase-7 audit record.
 pub fn authenticate(
     ctx: &AttemptContext<'_>,
     config: &Config,
     conv: &mut dyn Conversation,
     transport: &mut dyn RadiusTransport,
 ) -> PamOutcome {
+    authenticate_report(ctx, config, conv, transport).outcome
+}
+
+/// Run one authentication attempt and return the full [`AuthReport`] — the
+/// outcome plus the deciding server and a short machine reason for the audit
+/// record. See the module docs for the guarantees; see IMPLEMENTATION_SPEC.md
+/// §7 for the outcome table this implements.
+pub fn authenticate_report(
+    ctx: &AttemptContext<'_>,
+    config: &Config,
+    conv: &mut dyn Conversation,
+    transport: &mut dyn RadiusTransport,
+) -> AuthReport {
     if ctx.username.is_empty() {
-        return PamOutcome::AuthErr;
+        return AuthReport::of(PamOutcome::AuthErr, reason::EMPTY_USERNAME);
     }
     // Rule 11: an empty password never authenticates. (The PAM boundary has
     // already rejected null/empty tokens; this is the fail-closed backstop
     // for direct callers of the flow.)
     if ctx.password.is_empty() {
-        return PamOutcome::AuthErr;
+        return AuthReport::of(PamOutcome::AuthErr, reason::EMPTY_PASSWORD);
     }
     // config::parse guarantees at least one server; fail closed regardless.
     if config.servers.is_empty() {
-        return PamOutcome::Unavail;
+        return AuthReport::of(PamOutcome::Unavail, reason::NO_SERVERS);
     }
     match config.protocol {
         Protocol::Mschapv2 => mschapv2_flow(ctx, config, conv, transport),
@@ -143,7 +228,7 @@ fn mschapv2_flow(
     config: &Config,
     conv: &mut dyn Conversation,
     transport: &mut dyn RadiusTransport,
-) -> PamOutcome {
+) -> AuthReport {
     let mut push_notice_sent = false;
 
     for server in &config.servers {
@@ -151,12 +236,12 @@ fn mschapv2_flow(
 
         // Fresh material per server attempt; RNG failure denies (rule 18).
         let Ok(request_authenticator) = fresh_request_authenticator() else {
-            return PamOutcome::Unavail;
+            return AuthReport::of(PamOutcome::Unavail, reason::RNG_FAILURE).with_server(server.addr);
         };
         // The Identifier is public routing data; a random octet is fine.
         let id = request_authenticator[0];
         let Ok(challenges) = mschapv2::generate_challenges() else {
-            return PamOutcome::Unavail;
+            return AuthReport::of(PamOutcome::Unavail, reason::RNG_FAILURE).with_server(server.addr);
         };
 
         // §5 username note: the SAME string feeds the challenge hash (inside
@@ -178,14 +263,18 @@ fn mschapv2_flow(
             Ok(p) => p,
             // No valid request could be formed (e.g. over-long User-Name);
             // nothing was sent and no credential was evaluated.
-            Err(_) => return PamOutcome::Unavail,
+            Err(_) => {
+                return AuthReport::of(PamOutcome::Unavail, reason::ENCODE_FAILURE)
+                    .with_server(server.addr)
+            }
         };
 
         // Tell the user BEFORE blocking on the push wait (spec §7; CLAUDE.md
         // "silent block"). Once per attempt, not per server.
         if !push_notice_sent {
             if conv.info(PUSH_NOTICE).is_err() {
-                return PamOutcome::ConvErr;
+                return AuthReport::of(PamOutcome::ConvErr, reason::CONV_ERROR)
+                    .with_server(server.addr);
             }
             push_notice_sent = true;
         }
@@ -204,23 +293,30 @@ fn mschapv2_flow(
             Err(TransportError::Unreachable) => continue,
             // Silence (or a local I/O failure) is NOT failover (rule 16): a
             // silent server may already have pushed to the user's device.
-            Err(TransportError::Timeout | TransportError::Io) => return PamOutcome::Unavail,
-            Ok(response) => return mschapv2_response_outcome(&response, &request, conv),
+            Err(TransportError::Timeout) => {
+                return AuthReport::of(PamOutcome::Unavail, reason::TIMEOUT).with_server(server.addr)
+            }
+            Err(TransportError::Io) => {
+                return AuthReport::of(PamOutcome::Unavail, reason::IO_ERROR).with_server(server.addr)
+            }
+            Ok(response) => {
+                return mschapv2_response_outcome(&response, &request, conv).with_server(server.addr)
+            }
         }
     }
     // Every configured server was explicitly unreachable.
-    PamOutcome::Unavail
+    AuthReport::of(PamOutcome::Unavail, reason::ALL_UNREACHABLE)
 }
 
 fn mschapv2_response_outcome(
     response: &[u8],
     request: &mschapv2::MsChapV2Request,
     conv: &mut dyn Conversation,
-) -> PamOutcome {
+) -> AuthReport {
     // The binding already parsed and verified this datagram; re-parse for the
     // typed view and fail closed if anything is off anyway.
     let Ok(parsed) = parse_response(response) else {
-        return PamOutcome::Unavail;
+        return AuthReport::of(PamOutcome::Unavail, reason::BAD_RESPONSE);
     };
     match parsed.known_code() {
         Some(Code::AccessAccept) => {
@@ -228,9 +324,9 @@ fn mschapv2_response_outcome(
             // is absent or mismatched (constant-time compare) is a DENY even
             // though the packet said accept — that is the impersonation gap.
             if mschapv2::verify_access_accept(&parsed, request.expected_authenticator()) {
-                PamOutcome::Success
+                AuthReport::of(PamOutcome::Success, reason::SUCCESS)
             } else {
-                PamOutcome::AuthErr
+                AuthReport::of(PamOutcome::AuthErr, reason::MUTUAL_AUTH_FAILED)
             }
         }
         Some(Code::AccessReject) => {
@@ -244,11 +340,11 @@ fn mschapv2_response_outcome(
                     let _ = conv.info(PASSWORD_EXPIRED_NOTICE);
                 }
             }
-            PamOutcome::AuthErr
+            AuthReport::of(PamOutcome::AuthErr, reason::REJECT)
         }
         // MSCHAPv2 push mode has no interactive challenge; an
         // Access-Challenge (or any unknown code) is a deny, not a prompt.
-        _ => PamOutcome::AuthErr,
+        _ => AuthReport::of(PamOutcome::AuthErr, reason::UNEXPECTED_CODE),
     }
 }
 
@@ -279,12 +375,12 @@ fn pap_flow(
     config: &Config,
     conv: &mut dyn Conversation,
     transport: &mut dyn RadiusTransport,
-) -> PamOutcome {
+) -> AuthReport {
     for server in &config.servers {
         let secret = server.secret.expose_secret().as_bytes();
 
         let Ok(request_authenticator) = fresh_request_authenticator() else {
-            return PamOutcome::Unavail;
+            return AuthReport::of(PamOutcome::Unavail, reason::RNG_FAILURE).with_server(server.addr);
         };
         let id = request_authenticator[0];
 
@@ -296,7 +392,10 @@ fn pap_flow(
             &request_authenticator,
         ) {
             Ok(h) => h,
-            Err(_) => return PamOutcome::AuthErr,
+            Err(_) => {
+                return AuthReport::of(PamOutcome::AuthErr, reason::PASSWORD_UNREPRESENTABLE)
+                    .with_server(server.addr)
+            }
         };
         let packet = match build_pap_packet(
             ctx.username,
@@ -307,7 +406,10 @@ fn pap_flow(
             secret,
         ) {
             Ok(p) => p,
-            Err(_) => return PamOutcome::Unavail,
+            Err(_) => {
+                return AuthReport::of(PamOutcome::Unavail, reason::ENCODE_FAILURE)
+                    .with_server(server.addr)
+            }
         };
 
         let binding = RequestBinding::new(id, request_authenticator)
@@ -316,21 +418,27 @@ fn pap_flow(
             binding.verify_response(datagram, secret)
         }) {
             Err(TransportError::Unreachable) => continue,
-            Err(TransportError::Timeout | TransportError::Io) => return PamOutcome::Unavail,
+            Err(TransportError::Timeout) => {
+                return AuthReport::of(PamOutcome::Unavail, reason::TIMEOUT).with_server(server.addr)
+            }
+            Err(TransportError::Io) => {
+                return AuthReport::of(PamOutcome::Unavail, reason::IO_ERROR).with_server(server.addr)
+            }
             // A response arrived: this server owns the attempt from here on
             // (its State conversation cannot move to another server).
             Ok(response) => {
                 return pap_rounds(ctx, config, conv, transport, server.addr, secret, response)
+                    .with_server(server.addr)
             }
         }
     }
-    PamOutcome::Unavail
+    AuthReport::of(PamOutcome::Unavail, reason::ALL_UNREACHABLE)
 }
 
 /// One round's disposition: either the attempt is decided, or the server
 /// asked for another factor.
 enum Round {
-    Done(PamOutcome),
+    Done(AuthReport),
     Challenge(pap::Challenge),
 }
 
@@ -342,42 +450,47 @@ fn pap_rounds(
     server_addr: std::net::SocketAddr,
     secret: &[u8],
     mut response: Vec<u8>,
-) -> PamOutcome {
+) -> AuthReport {
     for _round in 0..MAX_CHALLENGE_ROUNDS {
         let round = {
             let Ok(parsed) = parse_response(&response) else {
-                return PamOutcome::Unavail;
+                return AuthReport::of(PamOutcome::Unavail, reason::BAD_RESPONSE);
             };
             match parsed.known_code() {
                 // PAP has no mutual authentication; the Accept's authenticity
                 // rests on the verified Response/Message-Authenticator.
-                Some(Code::AccessAccept) => Round::Done(PamOutcome::Success),
-                Some(Code::AccessReject) => Round::Done(PamOutcome::AuthErr),
+                Some(Code::AccessAccept) => {
+                    Round::Done(AuthReport::of(PamOutcome::Success, reason::SUCCESS))
+                }
+                Some(Code::AccessReject) => {
+                    Round::Done(AuthReport::of(PamOutcome::AuthErr, reason::REJECT))
+                }
                 Some(Code::AccessChallenge) => match pap::Challenge::from_response(&parsed) {
                     Ok(challenge) => Round::Challenge(challenge),
                     // Structurally bad challenge (e.g. multiple State): deny.
-                    Err(_) => Round::Done(PamOutcome::AuthErr),
+                    Err(_) => Round::Done(AuthReport::of(PamOutcome::AuthErr, reason::BAD_CHALLENGE)),
                 },
-                _ => Round::Done(PamOutcome::AuthErr),
+                _ => Round::Done(AuthReport::of(PamOutcome::AuthErr, reason::UNEXPECTED_CODE)),
             }
         };
 
         let challenge = match round {
-            Round::Done(outcome) => return outcome,
+            Round::Done(report) => return report,
             Round::Challenge(challenge) => challenge,
         };
 
         // Surface the (sanitized — A4) Reply-Message and collect the code.
         let code = match prompt_response(conv, challenge.prompt()) {
             Ok(code) => code,
-            Err(_) => return PamOutcome::ConvErr,
+            Err(_) => return AuthReport::of(PamOutcome::ConvErr, reason::CONV_ERROR),
         };
         if code.is_empty() {
-            return PamOutcome::AuthErr; // rule 11 applies to the OTP too
+            // rule 11 applies to the OTP too.
+            return AuthReport::of(PamOutcome::AuthErr, reason::EMPTY_OTP);
         }
 
         let Ok(request_authenticator) = fresh_request_authenticator() else {
-            return PamOutcome::Unavail;
+            return AuthReport::of(PamOutcome::Unavail, reason::RNG_FAILURE);
         };
         let id = request_authenticator[0];
         // Echo the newest State byte-for-byte; a challenge without State
@@ -390,7 +503,7 @@ fn pap_rounds(
             secret,
         ) {
             Ok(p) => p,
-            Err(_) => return PamOutcome::AuthErr,
+            Err(_) => return AuthReport::of(PamOutcome::AuthErr, reason::CHALLENGE_UNANSWERABLE),
         };
 
         let binding = RequestBinding::new(id, request_authenticator)
@@ -401,11 +514,11 @@ fn pap_rounds(
             binding.verify_response(datagram, secret)
         }) {
             Ok(next) => response = next,
-            Err(_) => return PamOutcome::Unavail,
+            Err(_) => return AuthReport::of(PamOutcome::Unavail, reason::TRANSPORT_ERROR),
         }
     }
     // The server demanded more challenge rounds than we allow: deny.
-    PamOutcome::AuthErr
+    AuthReport::of(PamOutcome::AuthErr, reason::MAX_ROUNDS)
 }
 
 fn build_pap_packet(

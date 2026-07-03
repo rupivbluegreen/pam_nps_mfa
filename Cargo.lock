@@ -6,7 +6,9 @@ version = 4
 name = "audit"
 version = "0.1.0"
 dependencies = [
+ "config",
  "hex-literal",
+ "libc",
 ]
 
 [[package]]

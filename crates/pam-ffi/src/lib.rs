@@ -15,6 +15,7 @@
 //! module is called concurrently and every piece of per-attempt state is a
 //! local in these functions.
 
+pub mod audit_emit;
 pub mod conversation;
 mod ffi;
 pub mod flow;
@@ -23,7 +24,8 @@ pub mod options;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use flow::AttemptContext;
+use audit::{AuthResult, SyslogSink};
+use flow::{reason, AttemptContext};
 use radius::UdpTransport;
 
 /// Linux-PAM return codes and flag bits, from
@@ -62,22 +64,44 @@ pub fn null_authtok_return(_disallow_null: bool) -> i32 {
 }
 
 /// The safe body of `pam_sm_authenticate` (the exported symbol in `ffi.rs`
-/// wraps this in `catch_unwind`). Gathers inputs through the shim, then runs
-/// the protocol-agnostic [`flow::authenticate`].
+/// wraps this in `catch_unwind`). Gathers inputs through the shim, runs the
+/// protocol-agnostic [`flow::authenticate_report`], and emits EXACTLY ONE
+/// audit record for the attempt (phase 7, IMPLEMENTATION_SPEC.md §8) — on
+/// every path, including the pre-config early returns.
+///
+/// Audit posture: the record receives only metadata (proto, server ip, user,
+/// result, reason, corr) — never the authtok or any packet bytes (rule 3). A3:
+/// each emit is panic-isolated, so an audit backend failure NEVER changes the
+/// returned PAM code.
 pub(crate) fn sm_authenticate(pam: ffi::Pam, flags: i32, args: &[String]) -> i32 {
     // A2 hardening first: this process is about to hold a password; make it
     // non-dumpable before the credential exists.
     ffi::harden_process();
 
     let opts = options::parse(args);
-    // A6: per-attempt correlation id for the (phase 7) audit records. Its
-    // RNG failure yields "unavailable" and never denies by itself — the id
-    // is not security material.
+    // A6: per-attempt correlation id for the audit records. Its RNG failure
+    // yields "unavailable" and never denies by itself — not security material.
     let corr = corr_id();
+
+    // Before config loads we do not know the configured backend, so pre-config
+    // failures emit best-effort to syslog (auditd may be unavailable). Every
+    // attempt still emits exactly one record.
+    let pre_config = SyslogSink;
 
     let username = match ffi::get_user(pam) {
         Ok(u) => u,
-        Err(code) => return code,
+        Err(code) => {
+            // A failed user fetch is still an attempt: emit one record.
+            audit_emit::emit_boundary(
+                &pre_config,
+                audit_emit::PROTO_UNKNOWN,
+                "",
+                &corr,
+                audit_emit::result_from_pam_code(code),
+                reason::USER_ERROR,
+            );
+            return code;
+        }
     };
 
     let disallow_null = flags & pam_codes::DISALLOW_NULL_AUTHTOK != 0;
@@ -94,23 +118,63 @@ pub(crate) fn sm_authenticate(pam: ffi::Pam, flags: i32, args: &[String]) -> i32
     };
     let authtok = match fetched {
         Ok(Some(tok)) => tok,
-        Ok(None) => return null_authtok_return(disallow_null),
-        Err(code) => return code,
+        Ok(None) => {
+            let code = null_authtok_return(disallow_null);
+            audit_emit::emit_boundary(
+                &pre_config,
+                audit_emit::PROTO_UNKNOWN,
+                &username,
+                &corr,
+                audit_emit::result_from_pam_code(code),
+                reason::NULL_AUTHTOK,
+            );
+            return code;
+        }
+        Err(code) => {
+            audit_emit::emit_boundary(
+                &pre_config,
+                audit_emit::PROTO_UNKNOWN,
+                &username,
+                &corr,
+                audit_emit::result_from_pam_code(code),
+                reason::AUTHTOK_ERROR,
+            );
+            return code;
+        }
     };
     if authtok.is_empty() {
         // Rule 11: reject empty passwords → PAM_AUTH_ERR (§7 table).
+        audit_emit::emit_boundary(
+            &pre_config,
+            audit_emit::PROTO_UNKNOWN,
+            &username,
+            &corr,
+            AuthResult::Denied,
+            reason::EMPTY_PASSWORD,
+        );
         return pam_codes::AUTH_ERR;
     }
     // A2: best-effort mlock of OUR credential copy (PAM's buffer is PAM's).
-    // Failure is hardening degradation, logged by the phase-7 audit backend,
-    // never an authentication error.
+    // Failure is hardening degradation, never an authentication error.
     let _locked = ffi::mlock_best_effort(authtok.expose_secret().as_bytes());
 
     let config = match config::load(Path::new(&opts.config_path)) {
         Ok(c) => c,
-        // Config error or permissive secret file: PAM_AUTHINFO_UNAVAIL, and
-        // phase 7 emits the critical audit record here (§7 table; rule 12).
-        Err(e) => return flow::outcome_for_config_error(&e).pam_code(),
+        Err(e) => {
+            // Config error or permissive secret file: PAM_AUTHINFO_UNAVAIL, and
+            // still emit one (syslog — auditd backend unknown) critical record
+            // with result=unavail reason=config_error. This NEVER changes the
+            // returned AUTHINFO_UNAVAIL (§7 table; rule 12; A3).
+            audit_emit::emit_boundary(
+                &pre_config,
+                audit_emit::PROTO_UNKNOWN,
+                &username,
+                &corr,
+                AuthResult::Unavail,
+                reason::CONFIG_ERROR,
+            );
+            return flow::outcome_for_config_error(&e).pam_code();
+        }
     };
 
     let mut conv = conversation::PamConversation::new(pam, silent);
@@ -129,7 +193,20 @@ pub(crate) fn sm_authenticate(pam: ffi::Pam, flags: i32, args: &[String]) -> i32
         password: &authtok,
         corr: &corr,
     };
-    flow::authenticate(&ctx, &config, &mut conv, &mut transport).pam_code()
+    let report = flow::authenticate_report(&ctx, &config, &mut conv, &mut transport);
+
+    // The configured backend (auditd | syslog | both). Exactly one record for
+    // this attempt, carrying ONLY metadata (never the authtok/packet bytes).
+    let sink = audit::from_backend(config.audit);
+    audit_emit::emit_attempt(
+        sink.as_ref(),
+        audit_emit::proto_str(config.protocol),
+        &username,
+        &corr,
+        &report,
+    );
+
+    report.outcome.pam_code()
 }
 
 /// The safe body of `pam_sm_setcred`: this module manages no credentials —

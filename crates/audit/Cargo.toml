@@ -4,8 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+build = "build.rs"
 
 [dependencies]
+# The plain `AuditBackend` enum (Copy, no secret material) selects a sink.
+# This is the ONLY cross-crate type the audit crate touches. It deliberately
+# does NOT depend on `secrets`: no secret type is ever imported or received
+# here (CLAUDE.md rule 3 — the record carries metadata only).
+config.workspace = true
+# Hand-declared libaudit + syslog FFI (src/ffi.rs) uses the C int/char types
+# and `libc::free`-free calls; the constants are declared by hand.
+libc.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
