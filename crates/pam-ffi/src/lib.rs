@@ -23,7 +23,8 @@ pub mod options;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use flow::{AttemptContext, UnwiredTransport};
+use flow::AttemptContext;
+use radius::UdpTransport;
 
 /// Linux-PAM return codes and flag bits, from
 /// `/usr/include/security/_pam_types.h`, declared by hand
@@ -113,10 +114,16 @@ pub(crate) fn sm_authenticate(pam: ffi::Pam, flags: i32, args: &[String]) -> i32
     };
 
     let mut conv = conversation::PamConversation::new(pam, silent);
-    // Phase 6 wires the real connected-UDP transport. Until then every
-    // exchange fails with a transport error, so a live stack fails CLOSED
-    // (PAM_AUTHINFO_UNAVAIL) while the full flow stays exercised by tests.
-    let mut transport = UnwiredTransport;
+    // The real connected-UDP transport (phase 6), built from the loaded
+    // config timing: the A1 two-stage probe/MFA windows, the identical-packet
+    // retry count, and the optional client bind address. Fails CLOSED on any
+    // transport error or timeout (PAM_AUTHINFO_UNAVAIL).
+    let mut transport = UdpTransport::from_config(
+        config.probe_timeout,
+        config.timeout,
+        config.retries,
+        config.source_ip,
+    );
     let ctx = AttemptContext {
         username: &username,
         password: &authtok,

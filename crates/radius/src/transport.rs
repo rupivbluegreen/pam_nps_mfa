@@ -35,17 +35,23 @@ impl core::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-/// One RADIUS request/response exchange against a single server.
+/// One RADIUS request/response exchange against a single `server`.
 ///
-/// Implementations send `request` (retransmitting the identical bytes per
-/// their retry policy), then deliver each received datagram to `accept`.
-/// A datagram for which `accept` returns `false` — wrong Identifier, wrong
-/// source, failed authenticator — is discarded and the wait continues until
-/// the deadline (CLAUDE.md rule 14). The first accepted datagram is
-/// returned. Implementations must cap the received datagram at 4096 octets.
+/// Implementations send `request` to `server` (retransmitting the identical
+/// bytes per their retry policy), then deliver each received datagram to
+/// `accept`. A datagram for which `accept` returns `false` — wrong
+/// Identifier, wrong source, failed authenticator — is discarded and the wait
+/// continues until the deadline (CLAUDE.md rule 14). The first accepted
+/// datagram is returned. Implementations must cap the received datagram at
+/// 4096 octets.
+///
+/// The `server` address is passed per call because the PAM flow iterates the
+/// configured server list and drives one exchange per server; the transport
+/// binds/connects to exactly that peer (SPEC_AMENDMENTS.md A5).
 pub trait RadiusTransport {
     fn exchange(
         &mut self,
+        server: std::net::SocketAddr,
         request: &[u8],
         accept: &mut dyn FnMut(&[u8]) -> bool,
     ) -> Result<Vec<u8>, TransportError>;
@@ -65,6 +71,7 @@ mod tests {
     impl RadiusTransport for ScriptedTransport {
         fn exchange(
             &mut self,
+            _server: std::net::SocketAddr,
             _request: &[u8],
             accept: &mut dyn FnMut(&[u8]) -> bool,
         ) -> Result<Vec<u8>, TransportError> {
@@ -79,6 +86,10 @@ mod tests {
         }
     }
 
+    fn test_server() -> std::net::SocketAddr {
+        "10.0.0.10:1812".parse().unwrap()
+    }
+
     #[test]
     fn non_matching_datagrams_are_discarded_not_returned() {
         let mut transport = ScriptedTransport {
@@ -86,7 +97,9 @@ mod tests {
             next: 0,
         };
         let got = transport
-            .exchange(b"request", &mut |d: &[u8]| d.get(1) == Some(&0x2A))
+            .exchange(test_server(), b"request", &mut |d: &[u8]| {
+                d.get(1) == Some(&0x2A)
+            })
             .expect("second datagram matches");
         assert_eq!(got, vec![0x02, 0x2A]);
     }
@@ -97,7 +110,7 @@ mod tests {
             datagrams: vec![vec![0x02, 0x01]],
             next: 0,
         };
-        let got = transport.exchange(b"request", &mut |_d: &[u8]| false);
+        let got = transport.exchange(test_server(), b"request", &mut |_d: &[u8]| false);
         assert_eq!(got, Err(TransportError::Timeout));
     }
 }

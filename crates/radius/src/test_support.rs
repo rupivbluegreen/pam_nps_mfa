@@ -9,6 +9,7 @@
 //! must discard).
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 
 use crate::transport::{RadiusTransport, TransportError};
 
@@ -38,6 +39,10 @@ pub struct FakeTransport {
     steps: VecDeque<Step>,
     /// Every request handed to [`RadiusTransport::exchange`], in call order.
     pub requests: Vec<Vec<u8>>,
+    /// The server address handed to each [`RadiusTransport::exchange`] call,
+    /// in call order. Lets a test assert which server the flow contacted
+    /// (e.g. that silence did NOT fail over to a second server — rule 16).
+    pub servers: Vec<SocketAddr>,
 }
 
 impl FakeTransport {
@@ -77,10 +82,12 @@ impl FakeTransport {
 impl RadiusTransport for FakeTransport {
     fn exchange(
         &mut self,
+        server: SocketAddr,
         request: &[u8],
         accept: &mut dyn FnMut(&[u8]) -> bool,
     ) -> Result<Vec<u8>, TransportError> {
         self.requests.push(request.to_vec());
+        self.servers.push(server);
         match self.steps.pop_front() {
             None => Err(TransportError::Timeout),
             Some(Step::Error(error)) => Err(error),
@@ -102,6 +109,10 @@ impl RadiusTransport for FakeTransport {
 mod tests {
     use super::*;
 
+    fn srv(n: u8) -> SocketAddr {
+        format!("10.0.0.{n}:1812").parse().unwrap()
+    }
+
     #[test]
     fn scripted_error_then_reply() {
         let mut t = FakeTransport::new();
@@ -109,12 +120,16 @@ mod tests {
         t.push_datagrams(vec![vec![1, 2], vec![3, 4]]);
 
         assert_eq!(
-            t.exchange(b"a", &mut |_| true),
+            t.exchange(srv(10), b"a", &mut |_| true),
             Err(TransportError::Unreachable)
         );
-        assert_eq!(t.exchange(b"b", &mut |d| d == [3, 4]), Ok(vec![3, 4]));
+        assert_eq!(
+            t.exchange(srv(11), b"b", &mut |d| d == [3, 4]),
+            Ok(vec![3, 4])
+        );
         assert_eq!(t.exchanges(), 2);
         assert_eq!(t.requests, vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(t.servers, vec![srv(10), srv(11)]);
     }
 
     #[test]
@@ -123,12 +138,12 @@ mod tests {
         t.push_datagrams(vec![vec![9, 9]]);
         // All datagrams rejected by the accept closure -> timeout.
         assert_eq!(
-            t.exchange(b"x", &mut |_| false),
+            t.exchange(srv(10), b"x", &mut |_| false),
             Err(TransportError::Timeout)
         );
         // Script exhausted -> timeout (fail closed).
         assert_eq!(
-            t.exchange(b"y", &mut |_| true),
+            t.exchange(srv(10), b"y", &mut |_| true),
             Err(TransportError::Timeout)
         );
     }

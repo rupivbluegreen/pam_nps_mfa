@@ -24,6 +24,7 @@ mod parse;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod transport;
+mod udp;
 
 pub use auth::{
     message_authenticator, response_authenticator, verify_response_authenticator,
@@ -35,6 +36,7 @@ pub use packet::{
 };
 pub use parse::{decode_vendor_specific, parse_response, ParsedResponse, VendorSpecific};
 pub use transport::{RadiusTransport, TransportError};
+pub use udp::UdpTransport;
 
 /// Minimum RADIUS packet length in octets (header only), RFC 2865 §3.
 pub const MIN_PACKET_LEN: usize = 20;

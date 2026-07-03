@@ -107,22 +107,6 @@ pub fn outcome_for_config_error(_error: &config::ConfigError) -> PamOutcome {
     PamOutcome::Unavail
 }
 
-/// Phase-5 stand-in for the real connected-UDP transport (phase 6): every
-/// exchange fails with a local transport error, so a live PAM stack running
-/// this build fails CLOSED with `PAM_AUTHINFO_UNAVAIL` — never a success and
-/// never a hang.
-pub struct UnwiredTransport;
-
-impl RadiusTransport for UnwiredTransport {
-    fn exchange(
-        &mut self,
-        _request: &[u8],
-        _accept: &mut dyn FnMut(&[u8]) -> bool,
-    ) -> Result<Vec<u8>, TransportError> {
-        Err(TransportError::Io)
-    }
-}
-
 /// Run one authentication attempt. See the module docs for the guarantees;
 /// see IMPLEMENTATION_SPEC.md §7 for the outcome table this implements.
 pub fn authenticate(
@@ -213,7 +197,7 @@ fn mschapv2_flow(
         // the transport's job (phase 6).
         let binding = RequestBinding::new(id, request_authenticator)
             .require_message_authenticator(config.require_message_authenticator);
-        match transport.exchange(&packet, &mut |datagram| {
+        match transport.exchange(server.addr, &packet, &mut |datagram| {
             binding.verify_response(datagram, secret)
         }) {
             // Explicit transport error: fail over to the next server.
@@ -328,14 +312,16 @@ fn pap_flow(
 
         let binding = RequestBinding::new(id, request_authenticator)
             .require_message_authenticator(config.require_message_authenticator);
-        match transport.exchange(&packet, &mut |datagram| {
+        match transport.exchange(server.addr, &packet, &mut |datagram| {
             binding.verify_response(datagram, secret)
         }) {
             Err(TransportError::Unreachable) => continue,
             Err(TransportError::Timeout | TransportError::Io) => return PamOutcome::Unavail,
             // A response arrived: this server owns the attempt from here on
             // (its State conversation cannot move to another server).
-            Ok(response) => return pap_rounds(ctx, config, conv, transport, secret, response),
+            Ok(response) => {
+                return pap_rounds(ctx, config, conv, transport, server.addr, secret, response)
+            }
         }
     }
     PamOutcome::Unavail
@@ -353,6 +339,7 @@ fn pap_rounds(
     config: &Config,
     conv: &mut dyn Conversation,
     transport: &mut dyn RadiusTransport,
+    server_addr: std::net::SocketAddr,
     secret: &[u8],
     mut response: Vec<u8>,
 ) -> PamOutcome {
@@ -410,7 +397,7 @@ fn pap_rounds(
             .require_message_authenticator(config.require_message_authenticator);
         // Mid-conversation there is no failover of any kind: the State is
         // bound to this server. Any transport error ends the attempt.
-        match transport.exchange(&follow_up, &mut |datagram| {
+        match transport.exchange(server_addr, &follow_up, &mut |datagram| {
             binding.verify_response(datagram, secret)
         }) {
             Ok(next) => response = next,
